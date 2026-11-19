@@ -14,7 +14,9 @@ timing rules.
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 from collections.abc import Mapping, Sequence
+from fractions import Fraction
 from typing import Any
 
 
@@ -23,6 +25,64 @@ Frame = Mapping[str, Any]
 
 class PacingError(ValueError):
     """Raised when pacing input is invalid or a batch cannot be committed."""
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _require_int(value: Any, name: str) -> int:
+    if not _is_int(value):
+        raise PacingError(f"{name} must be an integer number of milliseconds")
+    return value
+
+
+def _require_non_negative(value: Any, name: str) -> int:
+    value = _require_int(value, name)
+    if value < 0:
+        raise PacingError(f"{name} must be non-negative")
+    return value
+
+
+def _require_frame(frame: Any, name: str = "frame") -> Frame:
+    if not isinstance(frame, Mapping):
+        raise PacingError(f"{name} must be a mapping")
+    if "pts" not in frame or "dur" not in frame:
+        raise PacingError(f"{name} must contain 'pts' and 'dur'")
+    _require_int(frame["pts"], f"{name}['pts']")
+    _require_int(frame["dur"], f"{name}['dur']")
+    return frame
+
+
+def _require_frames(frames: Any) -> Sequence[Frame]:
+    if isinstance(frames, (str, bytes, Mapping)) or not isinstance(frames, Sequence):
+        raise PacingError("frames must be a sequence of frame mappings")
+    for index, frame in enumerate(frames):
+        _require_frame(frame, f"frames[{index}]")
+    return frames
+
+
+def _round_half_away(value: float | Fraction) -> int:
+    """Round to the nearest integer, ties away from zero."""
+    if isinstance(value, Fraction):
+        numerator = value.numerator
+        denominator = value.denominator
+    else:
+        if math.isnan(value) or math.isinf(value):
+            raise PacingError("cannot round a non-finite value")
+        # ``Fraction(value)`` is exact for a binary float.
+        fraction = Fraction(value)
+        numerator = fraction.numerator
+        denominator = fraction.denominator
+    sign = -1 if numerator < 0 else 1
+    quotient, remainder = divmod(abs(numerator), denominator)
+    if 2 * remainder >= denominator:
+        quotient += 1
+    return sign * quotient
+
+
+def _ceil_fraction(value: Fraction) -> int:
+    return -((-value.numerator) // value.denominator)
 
 
 def schedule(
@@ -48,7 +108,18 @@ def schedule(
     exact integer milliseconds and are compared with a 1 ms tolerance.
     """
 
-    raise NotImplementedError
+    clock_ms = _require_int(clock_ms, "clock_ms")
+    audio_clock_ms = _require_int(audio_clock_ms, "audio_clock_ms")
+    max_drift_ms = _require_non_negative(max_drift_ms, "max_drift_ms")
+    _require_frames(frames)
+
+    if not frames:
+        return []
+
+    drift = audio_clock_ms - clock_ms
+    shift = 0 if abs(drift) <= max_drift_ms else drift
+    origin = frames[0]["pts"]
+    return [clock_ms + shift + frame["pts"] - origin for frame in frames]
 
 
 def adjust_clock(
@@ -71,7 +142,27 @@ def adjust_clock(
     malformed clocks raise :class:`PacingError`.
     """
 
-    raise NotImplementedError
+    clock_ms = _require_int(clock_ms, "clock_ms")
+    audio_clock_ms = _require_int(audio_clock_ms, "audio_clock_ms")
+    max_drift_ms = _require_non_negative(max_drift_ms, "max_drift_ms")
+
+    if isinstance(gain, bool) or not isinstance(gain, (int, float)):
+        raise PacingError("gain must be a number in [0, 1]")
+    gain = float(gain)
+    if math.isnan(gain) or math.isinf(gain) or not 0.0 <= gain <= 1.0:
+        raise PacingError("gain must be a number in [0, 1]")
+
+    drift = audio_clock_ms - clock_ms
+    if abs(drift) <= max_drift_ms or gain == 0.0:
+        return clock_ms
+
+    correction = _round_half_away(drift * gain)
+    # Never overshoot the audio clock.
+    if drift > 0:
+        correction = min(correction, drift)
+    else:
+        correction = max(correction, drift)
+    return clock_ms + correction
 
 
 def drop_policy(late_ms: int, threshold_ms: int, mode: str) -> str:
@@ -94,7 +185,18 @@ def drop_policy(late_ms: int, threshold_ms: int, mode: str) -> str:
     :class:`PacingError`.
     """
 
-    raise NotImplementedError
+    late_ms = _require_int(late_ms, "late_ms")
+    threshold_ms = _require_non_negative(threshold_ms, "threshold_ms")
+
+    if mode == "low_latency":
+        return "show" if late_ms <= threshold_ms else "drop"
+    if mode == "smooth":
+        if late_ms <= threshold_ms:
+            return "show"
+        if late_ms <= 3 * threshold_ms:
+            return "repeat"
+        return "drop"
+    raise PacingError(f"unsupported drop mode: {mode!r}")
 
 
 def repeat_frame(frame: Frame, now_ms: int, clock_ms: int) -> dict[str, Any]:
@@ -110,7 +212,17 @@ def repeat_frame(frame: Frame, now_ms: int, clock_ms: int) -> dict[str, Any]:
     time raises :class:`PacingError`.
     """
 
-    raise NotImplementedError
+    frame = _require_frame(frame)
+    now_ms = _require_int(now_ms, "now_ms")
+    clock_ms = _require_int(clock_ms, "clock_ms")
+    elapsed = now_ms - clock_ms
+    if elapsed < 0:
+        raise PacingError("now_ms must not precede clock_ms")
+
+    repeated = dict(frame)
+    repeated["pts"] = frame["pts"]
+    repeated["dur"] = frame["dur"] + elapsed
+    return repeated
 
 
 def detect_stall(
@@ -132,7 +244,25 @@ def detect_stall(
     milliseconds, with a 1 ms boundary tolerance.
     """
 
-    raise NotImplementedError
+    now_ms = _require_int(now_ms, "now_ms")
+    stall_ms = _require_non_negative(stall_ms, "stall_ms")
+    if isinstance(history, (str, bytes, Mapping)) or not isinstance(
+        history, Sequence
+    ):
+        raise PacingError("history must be a sequence of timestamps")
+
+    previous: int | None = None
+    for index, arrival in enumerate(history):
+        arrival = _require_int(arrival, f"history[{index}]")
+        if previous is not None and arrival < previous:
+            raise PacingError("history must be in non-decreasing order")
+        previous = arrival
+
+    if not history:
+        return False
+    if now_ms < history[-1]:
+        raise PacingError("now_ms must not precede the latest arrival")
+    return now_ms - history[-1] >= stall_ms
 
 
 def vsync_align(t_ms: int, refresh_hz: float) -> int:
@@ -149,7 +279,17 @@ def vsync_align(t_ms: int, refresh_hz: float) -> int:
     :class:`PacingError`.
     """
 
-    raise NotImplementedError
+    t_ms = _require_non_negative(t_ms, "t_ms")
+    if isinstance(refresh_hz, bool) or not isinstance(refresh_hz, (int, float)):
+        raise PacingError("refresh_hz must be a positive number")
+    refresh_hz = float(refresh_hz)
+    if math.isnan(refresh_hz) or math.isinf(refresh_hz) or refresh_hz <= 0.0:
+        raise PacingError("refresh_hz must be a positive number")
+
+    period = Fraction(1000, 1) / Fraction(refresh_hz)
+    # Index of the nearest boundary; exact halves go to the later boundary.
+    index = int(math.floor(Fraction(t_ms) / period + Fraction(1, 2)))
+    return _round_half_away(index * period)
 
 
 def vfr_to_cfr(
@@ -175,7 +315,41 @@ def vfr_to_cfr(
     have a positive span; otherwise :class:`PacingError` is raised.
     """
 
-    raise NotImplementedError
+    if isinstance(target_fps, bool) or not isinstance(target_fps, (int, float)):
+        raise PacingError("target_fps must be a positive number")
+    target_fps = float(target_fps)
+    if math.isnan(target_fps) or math.isinf(target_fps) or target_fps <= 0.0:
+        raise PacingError("target_fps must be a positive number")
+    _require_frames(frames)
+
+    if not frames:
+        return []
+
+    origin = frames[0]["pts"]
+    span = frames[-1]["pts"] + frames[-1]["dur"] - origin
+    if span <= 0:
+        raise PacingError("source span must be positive")
+
+    period = Fraction(1000, 1) / Fraction(target_fps)
+    count = max(1, _ceil_fraction(Fraction(span) / period))
+
+    grid = [_round_half_away(index * period) for index in range(count + 1)]
+
+    # Source frames in order, so the active one can be found by a bisect on
+    # their (relative) start times.
+    starts = [frame["pts"] - origin for frame in frames]
+
+    output: list[dict[str, Any]] = []
+    for index in range(count):
+        source_time = grid[index]
+        active = bisect_right(starts, source_time) - 1
+        if active < 0:
+            active = 0
+        resampled = dict(frames[active])
+        resampled["pts"] = grid[index]
+        resampled["dur"] = grid[index + 1] - grid[index]
+        output.append(resampled)
+    return output
 
 
 def pace_batch(
@@ -206,4 +380,41 @@ def pace_batch(
     tolerance.
     """
 
-    raise NotImplementedError
+    if not isinstance(streams, Mapping):
+        raise PacingError("streams must be a mapping")
+    if not isinstance(config, Mapping):
+        raise PacingError("config must be a mapping")
+    if "max_drift_ms" not in config or "gain" not in config:
+        raise PacingError("config must supply 'max_drift_ms' and 'gain'")
+
+    max_drift_ms = _require_non_negative(config["max_drift_ms"], "max_drift_ms")
+    gain = config["gain"]
+
+    # Validate everything up front: a regression in any stream rejects the
+    # entire batch so no stream is partially committed.
+    prepared: list[tuple[str, Sequence[Frame], int, int]] = []
+    for stream_id, stream in streams.items():
+        if not isinstance(stream, Mapping):
+            raise PacingError(f"stream {stream_id!r} must be a mapping")
+        for key in ("frames", "clock_ms", "audio_clock_ms"):
+            if key not in stream:
+                raise PacingError(f"stream {stream_id!r} is missing {key!r}")
+        frames = _require_frames(stream["frames"])
+        clock_ms = _require_int(stream["clock_ms"], "clock_ms")
+        audio_clock_ms = _require_int(stream["audio_clock_ms"], "audio_clock_ms")
+        last_clock_ms = _require_int(
+            stream.get("last_clock_ms", clock_ms), "last_clock_ms"
+        )
+        if clock_ms < last_clock_ms:
+            raise PacingError(
+                f"stream {stream_id!r} clock regressed from "
+                f"{last_clock_ms} to {clock_ms}"
+            )
+        prepared.append((stream_id, frames, clock_ms, audio_clock_ms))
+
+    result: dict[str, Any] = {}
+    for stream_id, frames, clock_ms, audio_clock_ms in prepared:
+        adjusted = adjust_clock(clock_ms, audio_clock_ms, max_drift_ms, gain)
+        times = schedule(frames, adjusted, audio_clock_ms, max_drift_ms)
+        result[stream_id] = {"clock_ms": adjusted, "times": times}
+    return result
